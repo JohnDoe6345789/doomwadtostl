@@ -3,20 +3,21 @@ WAD to STL
 
 ```
 #!/usr/bin/env python3
-# doom_wad_to_stl_walls.py
+# doom_wad_to_stl_solid.py
 #
-# Export printable STL with *thick walls* from the first DOOM map in a WAD.
-# - Two-sided linedefs: wall spans the vertical overlap between the two sectors.
-# - One-sided linedefs: wall spans that sector's floor..ceiling and is offset inward.
-# Binary STL output. No external deps.
+# Printable STL from DOOM WAD:
+# - Thick walls (handles door openings).
+# - Triangulated **floors per sector** (so stairs/steps appear).
+# - **Base plate** under the whole model for easy bed removal.
+# - Optional **auto-scale** to a target max XY size (in mm) to avoid slicer scaling.
 #
-# MIT License
+# No external dependencies. MIT License.
 
 import argparse
 import os
 import re
 import struct
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 LE = "<"  # little-endian
 
@@ -27,9 +28,7 @@ LE = "<"  # little-endian
 class WadLump:
     __slots__ = ("offset", "size", "name")
     def __init__(self, offset: int, size: int, name: str):
-        self.offset = offset
-        self.size = size
-        self.name = name
+        self.offset = offset; self.size = size; self.name = name
 
 class WadFile:
     def __init__(self, path: str):
@@ -44,9 +43,7 @@ class WadFile:
         ident = ident.decode("ascii", errors="ignore")
         if ident not in ("IWAD", "PWAD"):
             raise ValueError(f"Unknown WAD type: {ident!r}")
-        self.ident = ident
-        self.numlumps = numlumps
-        self.dir_offset = infotableofs
+        self.ident = ident; self.numlumps = numlumps; self.dir_offset = infotableofs
 
         self.directory: List[WadLump] = []
         off = self.dir_offset
@@ -55,12 +52,6 @@ class WadFile:
             name = name_raw.split(b"\x00", 1)[0].decode("ascii", errors="ignore")
             self.directory.append(WadLump(lump_off, lump_size, name))
             off += 16
-
-    def read_lump(self, name: str) -> bytes:
-        for d in self.directory:
-            if d.name.upper() == name.upper():
-                return self.data[d.offset : d.offset + d.size]
-        raise KeyError(f"Lump not found: {name}")
 
     def read_lump_by_index(self, idx: int) -> bytes:
         d = self.directory[idx]
@@ -91,7 +82,6 @@ def parse_sectors(raw: bytes) -> List[Dict]:
     stride = 26
     for i in range(0, len(raw), stride):
         floorZ, ceilZ = struct.unpack_from(LE + "hh", raw, i)
-        # textures/light/special/tag not used for geometry here
         sectors.append({"floor": floorZ, "ceiling": ceilZ})
     return sectors
 
@@ -138,7 +128,125 @@ def normal(a, b, c):
     return (uy*vz - uz*vy, uz*vx - ux*vz, ux*vy - uy*vx)
 
 # ---------------------------
-# Wall builder (thick prisms)
+# Geometry utils
+# ---------------------------
+
+def bbox_of_points(pts: List[Tuple[float,float]]) -> Tuple[float, float, float, float]:
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    return min(xs), min(ys), max(xs), max(ys)
+
+def add_prism(tris, loop2d, z0, z1):
+    """
+    Closed prism from a simple convex/concave polygon (no holes).
+    loop2d must be CCW for outward normals on walls.
+    We add:
+      - side walls around the loop
+      - top and bottom caps (fan triangulation from vertex 0)
+    """
+    # top/bottom caps (fan)
+    v0_bot = (loop2d[0][0], loop2d[0][1], z0)
+    v0_top = (loop2d[0][0], loop2d[0][1], z1)
+    for i in range(1, len(loop2d)-1):
+        a = (loop2d[i][0],     loop2d[i][1],     z0)
+        b = (loop2d[i+1][0],   loop2d[i+1][1],   z0)
+        n = normal(v0_bot, b, a)        # bottom (winding reversed for outward)
+        tris.append((n, v0_bot, b, a))
+        A = (loop2d[i][0],     loop2d[i][1],     z1)
+        B = (loop2d[i+1][0],   loop2d[i+1][1],   z1)
+        n2 = normal(v0_top, A, B)        # top
+        tris.append((n2, v0_top, A, B))
+    # sides
+    for i in range(len(loop2d)):
+        j = (i+1) % len(loop2d)
+        a_bot = (loop2d[i][0], loop2d[i][1], z0)
+        b_bot = (loop2d[j][0], loop2d[j][1], z0)
+        b_top = (loop2d[j][0], loop2d[j][1], z1)
+        a_top = (loop2d[i][0], loop2d[i][1], z1)
+        n1 = normal(a_bot, b_bot, b_top)
+        n2 = normal(a_bot, b_top, a_top)
+        tris.append((n1, a_bot, b_bot, b_top))
+        tris.append((n2, a_bot, b_top, a_top))
+
+def is_ccw(poly):
+    # signed area > 0 => CCW
+    area = 0.0
+    for i in range(len(poly)):
+        x1,y1 = poly[i]
+        x2,y2 = poly[(i+1)%len(poly)]
+        area += (x2-x1)*(y2+y1)
+    return area < 0.0  # this variant uses a shoelace-like sign; adapt to our is_ccw
+                       # We’ll just force CCW later.
+
+def ear_clip_triangulate(poly: List[Tuple[float,float]]) -> List[Tuple[int,int,int]]:
+    """
+    Minimal ear clipping for simple polygon (no holes), returns triangle indices.
+    Assumes CCW input; forces it if needed.
+    """
+    if len(poly) < 3: return []
+    # Force CCW by area
+    def signed_area(P):
+        A = 0.0
+        for i in range(len(P)):
+            x1,y1 = P[i]; x2,y2 = P[(i+1)%len(P)]
+            A += x1*y2 - x2*y1
+        return A*0.5
+    P = poly[:]
+    if signed_area(P) < 0:
+        P = P[::-1]
+
+    indices = list(range(len(P)))
+    tris = []
+
+    def is_convex(i0,i1,i2):
+        x1,y1 = P[i0]; x2,y2 = P[i1]; x3,y3 = P[i2]
+        return (x2-x1)*(y3-y1) - (y2-y1)*(x3-x1) > 0
+
+    def point_in_tri(px,py, ax,ay, bx,by, cx,cy):
+        # Barycentric
+        v0x,v0y = cx-ax, cy-ay
+        v1x,v1y = bx-ax, by-ay
+        v2x,v2y = px-ax, py-ay
+        den = v0x*v1y - v1x*v0y
+        if abs(den) < 1e-12: return False
+        u = (v2x*v1y - v1x*v2y)/den
+        v = (v0x*v2y - v2x*v0y)/den
+        return (u >= 0) and (v >= 0) and (u+v <= 1)
+
+    count = 0
+    while len(indices) > 3 and count < 10000:
+        ear_found = False
+        for k in range(len(indices)):
+            i0 = indices[(k-1) % len(indices)]
+            i1 = indices[k]
+            i2 = indices[(k+1) % len(indices)]
+            if not is_convex(i0,i1,i2):
+                continue
+            ax,ay = P[i0]; bx,by = P[i1]; cx,cy = P[i2]
+            any_inside = False
+            for j in indices:
+                if j in (i0,i1,i2): continue
+                px,py = P[j]
+                if point_in_tri(px,py, ax,ay, bx,by, cx,cy):
+                    any_inside = True; break
+            if any_inside: continue
+            tris.append((i0,i1,i2))
+            del indices[k]
+            ear_found = True
+            break
+        if not ear_found:
+            # Fallback: fan triangulation (works for convex or “nearly”)
+            base = indices[0]
+            for t in range(1, len(indices)-1):
+                tris.append((base, indices[t], indices[t+1]))
+            indices = indices[:1]
+        count += 1
+
+    if len(indices) == 3:
+        tris.append((indices[0], indices[1], indices[2]))
+    return tris
+
+# ---------------------------
+# Walls (thick prisms)
 # ---------------------------
 
 def sector_heights(side_idx: int, sidedefs, sectors, default_floor=0.0, default_ceil=128.0):
@@ -149,101 +257,182 @@ def sector_heights(side_idx: int, sidedefs, sectors, default_floor=0.0, default_
             return float(sec["floor"]), float(sec["ceiling"])
     return float(default_floor), float(default_ceil)
 
-def add_prism(tris, quad_bottom, z0, z1):
-    """
-    quad_bottom: list of 4 (x,y) in order around the rectangle.
-    Creates side faces + top/bottom faces (closed prism).
-    """
-    # Make 8 verts
-    v = []
-    for (x, y) in quad_bottom:
-        v.append((x, y, z0))
-    for (x, y) in quad_bottom:
-        v.append((x, y, z1))
-    # Indices: bottom 0..3, top 4..7
-    faces = [
-        (0,1,2,3),  # bottom
-        (4,5,6,7),  # top
-        (0,1,5,4),  # sides
-        (1,2,6,5),
-        (2,3,7,6),
-        (3,0,4,7),
-    ]
-    for a,b,c,d in faces:
-        # two tris (a,b,c) and (a,c,d)
-        n1 = normal(v[a], v[b], v[c])
-        n2 = normal(v[a], v[c], v[d])
-        tris.append((n1, v[a], v[b], v[c]))
-        tris.append((n2, v[a], v[c], v[d]))
-
-def thick_wall_quads(verts, linedefs, sidedefs, sectors, scale=1.0, zscale=1.0,
-                     wall_thickness=8.0, default_height=128.0):
+def build_thick_walls(verts, linedefs, sidedefs, sectors,
+                      scale=1.0, zscale=1.0, wall_thickness=8.0, default_height=128.0):
     tris = []
     half_t = wall_thickness * 0.5
 
     for ld in linedefs:
         v1i, v2i = ld["v1"], ld["v2"]
-        if not (0 <= v1i < len(verts) and 0 <= v2i < len(verts)):
-            continue
+        if not (0 <= v1i < len(verts) and 0 <= v2i < len(verts)): continue
         (x1, y1) = verts[v1i]; (x2, y2) = verts[v2i]
         dx = x2 - x1; dy = y2 - y1
         L = (dx*dx + dy*dy) ** 0.5
-        if L == 0:
-            continue
+        if L == 0: continue
 
-        # Right-hand unit normal for v1->v2 (points to "right" sidedef)
+        # Right-hand unit normal for v1->v2 (points toward "right" sidedef)
         rx =  dy / L
         ry = -dx / L
 
-        # Heights on each side
         rf, rc = sector_heights(ld["right"], sidedefs, sectors, 0.0, default_height)
         lf, lc = sector_heights(ld["left"],  sidedefs, sectors, 0.0, default_height)
 
-        # Decide vertical span and lateral offsets
         if ld["right"] >= 0 and ld["left"] >= 0:
-            # Two-sided: build wall only where the two sectors overlap vertically
             z0 = max(rf, lf)
             z1 = min(rc, lc)
-            if z1 <= z0:
-                continue  # opening (e.g., doorway) → no wall
-            # Center thickness on the linedef
+            if z1 <= z0:  # doorway/opening
+                continue
             off_cx, off_cy = 0.0, 0.0
         elif ld["right"] >= 0:
-            # One-sided, right only → offset thickness into right sector
             z0, z1 = rf, rc
             off_cx, off_cy = rx * (half_t), ry * (half_t)
         elif ld["left"] >= 0:
-            # One-sided, left only → offset thickness into left sector (negative right normal)
             z0, z1 = lf, lc
             off_cx, off_cy = -rx * (half_t), -ry * (half_t)
         else:
-            # Degenerate linedef; skip
             continue
 
-        # Build the rectangle corners (2D), thickness centered or offset as above
-        # Two parallel lines offset ±half_t along the right-normal
-        # Start/end along the original segment direction.
         px1 = x1 + off_cx; py1 = y1 + off_cy
         px2 = x2 + off_cx; py2 = y2 + off_cy
 
-        # Outer/inner offsets
         o1x = px1 + rx * half_t; o1y = py1 + ry * half_t
         o2x = px2 + rx * half_t; o2y = py2 + ry * half_t
         i1x = px1 - rx * half_t; i1y = py1 - ry * half_t
         i2x = px2 - rx * half_t; i2y = py2 - ry * half_t
 
-        # Scale to output units
-        quad2d = [
+        quad = [
             (i1x * scale, i1y * scale),
             (i2x * scale, i2y * scale),
             (o2x * scale, o2y * scale),
             (o1x * scale, o1y * scale),
         ]
-        z0s = z0 * zscale
-        z1s = z1 * zscale
+        add_prism(tris, quad, z0 * zscale, z1 * zscale)
+    return tris
 
-        add_prism(tris, quad2d, z0s, z1s)
+# ---------------------------
+# Sector floor loops
+# ---------------------------
 
+def sector_boundary_loops(sector_idx: int, verts, linedefs, sidedefs) -> List[List[Tuple[float,float]]]:
+    """
+    Extract oriented boundary edges for a sector by walking linedefs:
+    - if right sector == s and left != s, add edge v1->v2 (sector interior on left).
+    - if left sector == s and right != s, add edge v2->v1 (still interior on left).
+    Then chain edges into loops.
+    NOTE: This ignores holes (we output all loops as separate polygons).
+    """
+    edges = []
+    for ld in linedefs:
+        r = ld["right"]; l = ld["left"]
+        if 0 <= r and r < len(sidedefs) and sidedefs[r]["sector"] == sector_idx and not (0 <= l < len(sidedefs) and sidedefs[l]["sector"] == sector_idx):
+            edges.append( (ld["v1"], ld["v2"]) )
+        elif 0 <= l and l < len(sidedefs) and sidedefs[l]["sector"] == sector_idx and not (0 <= r < len(sidedefs) and sidedefs[r]["sector"] == sector_idx):
+            edges.append( (ld["v2"], ld["v1"]) )
+    # Chain into loops
+    # map start->list of ends
+    from collections import defaultdict, deque
+    outgoing = defaultdict(list)
+    incoming = defaultdict(list)
+    for a,b in edges:
+        outgoing[a].append(b)
+        incoming[b].append(a)
+
+    loops = []
+    used = set()
+    for a,b in edges:
+        if (a,b) in used: continue
+        # start chain at a,b
+        chain = [a, b]
+        used.add((a,b))
+        cur = b
+        # forward
+        while True:
+            nxts = [n for n in outgoing[cur] if (cur,n) not in used]
+            if not nxts: break
+            n = nxts[0]
+            chain.append(n)
+            used.add((cur,n))
+            cur = n
+            if cur == chain[0]:
+                break
+        # close?
+        if chain[0] == chain[-1] and len(chain) > 3:
+            chain = chain[:-1]
+        # Convert to points
+        loop = [(float(verts[i][0]), float(verts[i][1])) for i in chain]
+        # Force CCW by area
+        area = 0.0
+        for i in range(len(loop)):
+            x1,y1 = loop[i]; x2,y2 = loop[(i+1)%len(loop)]
+            area += x1*y2 - x2*y1
+        if area < 0:
+            loop.reverse()
+        # Dedup short loops
+        if len(loop) >= 3:
+            loops.append(loop)
+    return loops
+
+def build_sector_floors(verts, linedefs, sidedefs, sectors, scale=1.0, zscale=1.0, floor_thickness=2.0):
+    """
+    For each sector:
+      - find boundary loops (outer edges),
+      - triangulate each loop (no holes),
+      - extrude downward by floor_thickness to make a plate.
+    Stairs/steps appear because each sector uses its own floor Z.
+    """
+    tris = []
+    for sidx, sec in enumerate(sectors):
+        z_top = sec["floor"] * zscale
+        z_bot = (sec["floor"] - floor_thickness) * zscale
+        loops = sector_boundary_loops(sidx, verts, linedefs, sidedefs)
+        for loop in loops:
+            # scale to output units
+            loop_s = [(x*scale, y*scale) for (x,y) in loop]
+            # Triangulate top face
+            tri_idx = ear_clip_triangulate(loop_s)
+            # Build as a thin prism (downwards)
+            # Top cap (using triangulation) + bottom cap + side walls
+            # Top cap
+            for a,b,c in tri_idx:
+                A = (loop_s[a][0], loop_s[a][1], z_top)
+                B = (loop_s[b][0], loop_s[b][1], z_top)
+                C = (loop_s[c][0], loop_s[c][1], z_top)
+                n = normal(A, B, C)
+                tris.append((n, A, B, C))
+            # Bottom cap (reversed)
+            for a,b,c in tri_idx:
+                A = (loop_s[a][0], loop_s[a][1], z_bot)
+                B = (loop_s[b][0], loop_s[b][1], z_bot)
+                C = (loop_s[c][0], loop_s[c][1], z_bot)
+                n = normal(C, B, A)
+                tris.append((n, C, B, A))
+            # sides
+            for i in range(len(loop_s)):
+                j = (i+1) % len(loop_s)
+                a_top = (loop_s[i][0], loop_s[i][1], z_top)
+                b_top = (loop_s[j][0], loop_s[j][1], z_top)
+                b_bot = (loop_s[j][0], loop_s[j][1], z_bot)
+                a_bot = (loop_s[i][0], loop_s[i][1], z_bot)
+                n1 = normal(a_bot, b_bot, b_top)
+                n2 = normal(a_bot, b_top, a_top)
+                tris.append((n1, a_bot, b_bot, b_top))
+                tris.append((n2, a_bot, b_top, a_top))
+    return tris
+
+# ---------------------------
+# Base plate
+# ---------------------------
+
+def build_base_plate(all_points_xy: List[Tuple[float,float]], top_z: float,
+                     margin=10.0, thickness=2.0):
+    """
+    Rectangle around the model (with margin), from (top_z - thickness) to top_z.
+    """
+    tris = []
+    xmin,ymin,xmax,ymax = bbox_of_points(all_points_xy)
+    xmin -= margin; ymin -= margin; xmax += margin; ymax += margin
+    loop = [(xmin,ymin),(xmax,ymin),(xmax,ymax),(xmin,ymax)]
+    add_prism(tris, loop, top_z - thickness, top_z)
     return tris
 
 # ---------------------------
@@ -255,12 +444,10 @@ def read_map_lumps(wad: WadFile, map_dir_index: int) -> Dict[str, bytes]:
     out: Dict[str, bytes] = {}
     for i in range(map_dir_index + 1, len(wad.directory)):
         name = wad.directory[i].name.upper()
-        if MAP_NAME_RE.match(name):
-            break
+        if MAP_NAME_RE.match(name): break
         if name in needed:
             out[name] = wad.read_lump_by_index(i)
-        if len(out) == 4:
-            break
+        if len(out) == 4: break
     missing = [k for k in needed if k not in out]
     if missing:
         raise ValueError(f"Map missing required lumps: {missing}")
@@ -271,15 +458,23 @@ def read_map_lumps(wad: WadFile, map_dir_index: int) -> Dict[str, bytes]:
 # ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert a DOOM WAD map to STL with thick, printable walls.")
+    ap = argparse.ArgumentParser(description="Convert a DOOM WAD map to printable STL (walls + floors + base).")
     ap.add_argument("wad", help="Input WAD file")
     ap.add_argument("out", help="Output STL path")
     ap.add_argument("--map-name", help="Map name to export (e.g., MAP01 or E1M1)")
     ap.add_argument("--map-index", type=int, default=0, help="If no map-name, choose Nth discovered map (default 0)")
-    ap.add_argument("--scale", type=float, default=1.0, help="XY scale (1.0 = DOOM units)")
-    ap.add_argument("--zscale", type=float, default=1.0, help="Z scale (vertical)")
+    # Sizing
+    ap.add_argument("--scale", type=float, default=None, help="XY scale in mm per DOOM unit (overridden by --autoscale-mm)")
+    ap.add_argument("--autoscale-mm", type=float, default=200.0,
+                    help="Auto-scale so the longest XY dimension ≈ this many mm (default 200). Set to 0 to disable.")
+    ap.add_argument("--zscale", type=float, default=None, help="Z scale (mm per DOOM unit). Default = same as XY scale.")
+    # Geometry
     ap.add_argument("--wall-thickness", type=float, default=8.0, help="Wall thickness in DOOM units (pre-scale)")
     ap.add_argument("--default-height", type=float, default=128.0, help="Fallback ceiling if sector missing")
+    ap.add_argument("--floor-thickness", type=float, default=2.0, help="Thickness of each sector floor slab (DOOM units)")
+    # Base
+    ap.add_argument("--base-margin", type=float, default=10.0, help="Base plate margin around model (mm, after scaling)")
+    ap.add_argument("--base-thickness", type=float, default=2.0, help="Base plate thickness (mm)")
     args = ap.parse_args()
 
     wad = WadFile(args.wad)
@@ -290,16 +485,13 @@ def main():
         cand = [i for i, d in enumerate(wad.directory) if d.name.upper() == name_upper]
         if not cand:
             raise SystemExit(f"Map {args.map_name} not found.")
-        map_idx = cand[0]
-        map_name = name_upper
+        map_idx = cand[0]; map_name = name_upper
     else:
         maps = find_maps(wad)
-        if not maps:
-            raise SystemExit("No maps found in WAD.")
+        if not maps: raise SystemExit("No maps found in WAD.")
         if not (0 <= args.map_index < len(maps)):
             raise SystemExit(f"--map-index out of range (0..{len(maps)-1}).")
-        map_idx = maps[args.map_index]
-        map_name = wad.directory[map_idx].name
+        map_idx = maps[args.map_index]; map_name = wad.directory[map_idx].name
 
     lumps = read_map_lumps(wad, map_idx)
     verts = parse_vertexes(lumps["VERTEXES"])
@@ -307,20 +499,56 @@ def main():
     sides = parse_sidedefs(lumps["SIDEDEFS"])
     secs  = parse_sectors(lumps["SECTORS"])
 
-    tris = thick_wall_quads(
+    # Pre-scale bbox to compute autoscale factor
+    xs = [v[0] for v in verts]; ys = [v[1] for v in verts]
+    minx, maxx = min(xs), max(xs); miny, maxy = min(ys), max(ys)
+    span_x = maxx - minx; span_y = maxy - miny
+    longest = max(span_x, span_y) if max(span_x, span_y) > 0 else 1.0
+
+    if args.autoscale-mm and args.autoscale-mm > 0:
+        scale = float(args.autoscale-mm) / float(longest)  # mm per DOOM unit
+    else:
+        scale = args.scale if args.scale is not None else 0.05  # default ~0.05 mm/u (~205 mm for a 4096u map)
+    zscale = args.zscale if args.zscale is not None else scale
+
+    tris = []
+    # Walls
+    tris += build_thick_walls(
         verts, lines, sides, secs,
-        scale=args.scale, zscale=args.zscale,
+        scale=scale, zscale=zscale,
         wall_thickness=args.wall_thickness,
         default_height=args.default_height
     )
 
     if not tris:
-        raise SystemExit("No wall geometry generated.")
+        raise SystemExit("No wall geometry generated (empty map?).")
 
-    header = f"DOOM map {map_name} with thick walls"
+    # Floors (per sector, thin slabs extruded downward)
+    tris += build_sector_floors(
+        verts, lines, sides, secs,
+        scale=scale, zscale=zscale,
+        floor_thickness=args.floor_thickness
+    )
+
+    # Base plate: place it under the **lowest** sector floor so everything sits on it.
+    all_xy = [(v[0]*scale, v[1]*scale) for v in verts]
+    min_floor = min([s["floor"] for s in secs]) if secs else 0.0
+    base_top_z = min_floor * zscale
+    tris += build_base_plate(
+        all_points_xy=all_xy,
+        top_z=base_top_z,
+        margin=args.base_margin,
+        thickness=args.base_thickness
+    )
+
+    header = f"DOOM map {map_name} (walls+floors+base)"
     write_binary_stl(tris, args.out, header)
-    print(f"Wrote {len(tris)} triangles to {args.out}")
-
+    print(f"[OK] Wrote {len(tris)} triangles to {args.out}")
+    print(f"[INFO] XY scale = {scale:.5f} mm/u, Z scale = {zscale:.5f} mm/u")
+    print(f"[INFO] Model spans ≈ {span_x*scale:.1f} x {span_y*scale:.1f} mm (before base margin)")
+    print(f"[INFO] Base thickness = {args.base_thickness} mm, floor slab thickness = {args.floor_thickness*zscale:.2f} mm")
+    print("[TIP] If stairs look blocky, they come from sector steps — that’s correct for classic DOOM.")
+    
 if __name__ == "__main__":
     main()
 
